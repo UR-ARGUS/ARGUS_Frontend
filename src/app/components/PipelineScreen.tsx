@@ -7,6 +7,32 @@ import {
   Shield, Brain, AlertTriangle,
 } from "lucide-react";
 import { T } from "./tokens";
+import type { ScanResult, ScanProgress } from "../types/scan";
+
+const SCAN_API_BASE = "http://localhost:8085/api/v1/scan";
+const POLL_INTERVAL_MS = 3000;
+
+async function pollScanResult(taskId: string, onProgress: (progress: ScanProgress) => void): Promise<ScanResult> {
+  for (;;) {
+    const res = await fetch(`${SCAN_API_BASE}/${taskId}`);
+    if (!res.ok) throw new Error(`스캔 상태 조회 실패 (HTTP ${res.status})`);
+    const data = await res.json();
+
+    if (data.state === "SUCCESS") {
+      if (data.result?.status === "failed") {
+        throw new Error(data.result.error || "스캔이 실패했습니다.");
+      }
+      return data.result?.results as ScanResult;
+    }
+    if (data.state === "FAILURE") {
+      throw new Error(data.error || "스캔이 실패했습니다.");
+    }
+    if (data.state === "PROGRESS" && data.progress) {
+      onProgress(data.progress as ScanProgress);
+    }
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+  }
+}
 
 // ─────────────────────────────────────────
 // 공통 원자
@@ -76,30 +102,20 @@ function PipeBody({ children }: { children: React.ReactNode }) {
 // 스캔 진행 바
 // ─────────────────────────────────────────
 
-function ScanBar({ label, tag, tagColor, barColor, delay, running }: {
-  label: string; tag: string; tagColor: string; barColor: string; delay: number; running: boolean;
+function ScanBar({ label, tag, tagColor, barColor, running, percent }: {
+  label: string; tag: string; tagColor: string; barColor: string; running: boolean; percent: number;
 }) {
-  const [pct, setPct] = useState(0);
-  useEffect(() => {
-    if (!running) { setPct(0); return; }
-    const t = setTimeout(() => {
-      const iv = setInterval(() => setPct(p => { if (p >= 100) { clearInterval(iv); return 100; } return p + 0.65; }), 22);
-      return () => clearInterval(iv);
-    }, delay);
-    return () => clearTimeout(t);
-  }, [running, delay]);
-
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6, padding: "9px 11px", borderRadius: 8, background: T.bg }}>
       <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
         <span style={{ fontFamily: "Inter, sans-serif", fontSize: 11, fontWeight: 600, color: T.sub, flex: 1 }}>{label}</span>
         <span style={{ fontFamily: "Inter, sans-serif", fontSize: 9, fontWeight: 600, color: tagColor, background: `${tagColor}18`, padding: "1px 6px", borderRadius: 4 }}>{tag}</span>
         <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 10, color: running ? barColor : T.muted, width: 30, textAlign: "right" }}>
-          {running ? (pct < 100 ? `${Math.round(pct)}%` : "완료") : "대기"}
+          {running ? (percent < 100 ? `${Math.round(percent)}%` : "완료") : "대기"}
         </span>
       </div>
       <div style={{ height: 5, borderRadius: 99, background: T.border, overflow: "hidden" }}>
-        <motion.div style={{ height: "100%", borderRadius: 99, background: barColor }} initial={{ width: 0 }} animate={{ width: `${pct}%` }} />
+        <motion.div style={{ height: "100%", borderRadius: 99, background: barColor }} animate={{ width: `${running ? percent : 0}%` }} />
       </div>
     </div>
   );
@@ -167,10 +183,29 @@ function SevBars() {
 // 스캔 입력 패널
 // ─────────────────────────────────────────
 
-function ScanInputPanel({ scanning, onScan }: { scanning: boolean; onScan: () => void }) {
+function ScanInputPanel({ scanning, scanError, onScanStart, onScanProgress, onScanFinish }: {
+  scanning: boolean;
+  scanError: string | null;
+  onScanStart: () => void;
+  onScanProgress: (progress: ScanProgress) => void;
+  onScanFinish: (result: ScanResult | null, error?: string) => void;
+}) {
   const [dastEnabled, setDastEnabled] = useState(true);
   const [sastEnabled, setSastEnabled] = useState(false);
   const [dastUrl, setDastUrl]         = useState("");
+  
+  // 로그인 및 인증 설정 상태 추가
+  const [authEnabled, setAuthEnabled] = useState(false);
+  const [authMode, setAuthMode]       = useState<"form" | "header">("form");
+  const [customHeader, setCustomHeader] = useState(""); // 예: Cookie: Session=xyz
+
+  const [loginUrl, setLoginUrl]       = useState("");
+  const [usernameField, setUsernameField] = useState("username");
+  const [passwordField, setPasswordField] = useState("password");
+  const [username, setUsername]       = useState("");
+  const [password, setPassword]       = useState("");
+  const [loggedInIndicator, setLoggedInIndicator] = useState("Logout");
+
   const [gitUrl, setGitUrl]           = useState("");
   const [branch, setBranch]           = useState("main");
   const [sastMode, setSastMode]       = useState<"git" | "zip">("git");
@@ -185,6 +220,55 @@ function ScanInputPanel({ scanning, onScan }: { scanning: boolean; onScan: () =>
   };
 
   const canScan = (dastEnabled && dastUrl.trim()) || (sastEnabled && (gitUrl.trim() || zipFile));
+
+  // 스캔 트리거 연동 함수
+  const triggerScanApi = async () => {
+    if (!canScan) return;
+
+    if (dastEnabled) {
+      try {
+        const parsed = new URL(dastUrl.trim());
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("invalid protocol");
+      } catch {
+        onScanFinish(null, "올바른 URL 형식이 아닙니다. (예: https://target-service.com)");
+        return;
+      }
+    }
+
+    onScanStart();
+    try {
+      const payload = {
+        target_url: dastUrl,
+        login_config: authEnabled && authMode === "form" ? {
+          login_url: loginUrl || dastUrl,
+          username_field: usernameField,
+          password_field: passwordField,
+          username: username,
+          password: password,
+          logged_in_indicator: loggedInIndicator
+        } : null,
+        custom_header: authEnabled && authMode === "header" ? customHeader : null
+      };
+
+      const response = await fetch(`${SCAN_API_BASE}/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) throw new Error(`스캔 요청 실패 (HTTP ${response.status})`);
+      const data = await response.json();
+      console.log("Scan Triggered:", data);
+
+      const result = await pollScanResult(data.task_id, onScanProgress);
+      onScanFinish(result);
+    } catch (err) {
+      console.error("Scan triggering failed:", err);
+      const message = err instanceof Error ? err.message : "스캔 중 오류가 발생했습니다.";
+      onScanFinish(null, message);
+    }
+  };
 
   return (
     <div style={{ width: "100%", maxWidth: 820 }}>
@@ -213,140 +297,138 @@ function ScanInputPanel({ scanning, onScan }: { scanning: boolean; onScan: () =>
             )}
           </div>
           {dastEnabled && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8, paddingLeft: 4 }}>
-              <Link2 size={13} color={T.muted} style={{ flexShrink: 0 }} />
-              <input
-                value={dastUrl} onChange={e => setDastUrl(e.target.value)}
-                placeholder="https://target-service.com"
-                style={{ flex: 1, border: "none", outline: "none", fontFamily: "JetBrains Mono, monospace", fontSize: 13, color: T.text, background: "transparent" }}
-              />
-            </div>
-          )}
-        </div>
-
-        <Divider />
-
-        {/* ── SAST 행 ── */}
-        <div style={{ padding: "12px 16px", display: "flex", flexDirection: "column", gap: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <button onClick={() => setSastEnabled(v => !v)} style={{ border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", padding: 0 }}>
-              {sastEnabled
-                ? <ToggleRight size={22} color={T.purple} />
-                : <ToggleLeft  size={22} color={T.muted} />}
-            </button>
-            <Code2 size={14} color={sastEnabled ? T.purple : T.muted} />
-            <span style={{ fontFamily: "Inter, sans-serif", fontSize: 11, fontWeight: 700, color: sastEnabled ? T.purple : T.muted, background: sastEnabled ? T.purpleBg : T.bg, padding: "1px 7px", borderRadius: 4 }}>SAST</span>
-            <span style={{ fontFamily: "Inter, sans-serif", fontSize: 11, color: T.muted }}>정적 분석 — Git 저장소 또는 ZIP 업로드</span>
-          </div>
-
-          {sastEnabled && (
-            <div style={{ marginTop: 10, paddingLeft: 4, display: "flex", flexDirection: "column", gap: 8 }}>
-              {/* 서브 탭 */}
-              <div style={{ display: "flex", gap: 4, background: T.bg, borderRadius: 7, padding: 3, alignSelf: "flex-start" }}>
-                {([
-                  { id: "git" as const, icon: GitBranch, label: "Git 주소" },
-                  { id: "zip" as const, icon: FileArchive, label: "ZIP / 폴더" },
-                ] as const).map(tab => (
-                  <button key={tab.id} onClick={() => setSastMode(tab.id)} style={{
-                    display: "flex", alignItems: "center", gap: 5,
-                    padding: "4px 12px", borderRadius: 5, border: "none", cursor: "pointer",
-                    fontFamily: "Inter, sans-serif", fontSize: 11,
-                    fontWeight: sastMode === tab.id ? 600 : 400,
-                    color: sastMode === tab.id ? T.purple : T.muted,
-                    background: sastMode === tab.id ? T.surface : "transparent",
-                    boxShadow: sastMode === tab.id ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
-                    transition: "all 0.13s",
-                  }}>
-                    <tab.icon size={12} />
-                    {tab.label}
-                  </button>
-                ))}
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8, paddingLeft: 4 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <Link2 size={13} color={T.muted} style={{ flexShrink: 0 }} />
+                <input
+                  value={dastUrl} onChange={e => setDastUrl(e.target.value)}
+                  placeholder="https://target-service.com"
+                  style={{ flex: 1, border: "none", outline: "none", fontFamily: "JetBrains Mono, monospace", fontSize: 13, color: T.text, background: "transparent" }}
+                />
               </div>
 
-              {sastMode === "git" ? (
-                /* Git 입력 */
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <GitBranch size={13} color={T.muted} style={{ flexShrink: 0 }} />
-                  <input
-                    value={gitUrl} onChange={e => setGitUrl(e.target.value)}
-                    placeholder="https://github.com/org/repo  또는  git@github.com:org/repo.git"
-                    style={{ flex: 1, border: "none", outline: "none", fontFamily: "JetBrains Mono, monospace", fontSize: 12, color: T.text, background: "transparent" }}
-                  />
-                  <div style={{ position: "relative", flexShrink: 0 }}>
-                    <select value={branch} onChange={e => setBranch(e.target.value)} style={{
-                      appearance: "none", fontFamily: "Inter, sans-serif", fontSize: 11, fontWeight: 500,
-                      color: T.sub, background: T.bg, border: `1px solid ${T.border}`,
-                      borderRadius: 6, padding: "4px 20px 4px 8px", cursor: "pointer", outline: "none",
-                    }}>
-                      {["main", "develop", "staging", "release"].map(b => <option key={b}>{b}</option>)}
-                    </select>
-                    <svg style={{ position: "absolute", right: 5, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }} width="10" height="10" viewBox="0 0 10 10">
-                      <path d="M2 3.5L5 6.5L8 3.5" stroke={T.muted} strokeWidth="1.5" fill="none" strokeLinecap="round" />
-                    </svg>
-                  </div>
+              {/* ZAP DAST 전용 자동 로그인 인증 설정 패널 */}
+              <div style={{ borderTop: `1px dashed ${T.border}`, paddingTop: 10, marginTop: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <button onClick={() => setAuthEnabled(v => !v)} style={{ border: "none", background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", padding: 0 }}>
+                    {authEnabled
+                      ? <ToggleRight size={18} color={T.blue} />
+                      : <ToggleLeft  size={18} color={T.muted} />}
+                  </button>
+                  <span style={{ fontFamily: "Inter, sans-serif", fontSize: 11, fontWeight: 600, color: authEnabled ? T.text : T.muted }}>
+                    인증 세션 자동 적용 (Parameter Tampering 테스트 최적화)
+                  </span>
                 </div>
-              ) : (
-                /* ZIP 드롭존 */
-                zipFile ? (
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 8, background: T.purpleBg, border: `1px solid ${T.purple}28` }}>
-                    <FileArchive size={16} color={T.purple} />
-                    <div style={{ flex: 1 }}>
-                      <p style={{ margin: 0, fontFamily: "Inter, sans-serif", fontSize: 12, fontWeight: 600, color: T.purple }}>{zipFile.name}</p>
-                      <p style={{ margin: 0, fontFamily: "Inter, sans-serif", fontSize: 10, color: T.muted }}>{(zipFile.size / 1024 / 1024).toFixed(1)} MB</p>
-                    </div>
-                    <button onClick={() => setZipFile(null)} style={{ border: "none", background: "transparent", cursor: "pointer", color: T.muted, display: "flex" }}>
-                      <X size={14} />
-                    </button>
-                  </div>
-                ) : (
-                  <div
-                    onDragOver={e => { e.preventDefault(); setDragOver(true); }}
-                    onDragLeave={() => setDragOver(false)}
-                    onDrop={handleDrop}
-                    onClick={() => fileRef.current?.click()}
-                    style={{
-                      padding: "18px 16px", borderRadius: 8, cursor: "pointer",
-                      border: `1.5px dashed ${dragOver ? T.purple : T.borderHov}`,
-                      background: dragOver ? T.purpleBg : T.bg,
-                      display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
-                      transition: "all 0.15s",
-                    }}
-                  >
-                    <Upload size={20} color={dragOver ? T.purple : T.muted} />
-                    <p style={{ margin: 0, fontFamily: "Inter, sans-serif", fontSize: 12, fontWeight: 600, color: dragOver ? T.purple : T.sub }}>
-                      ZIP 또는 tar.gz 파일을 드래그하거나 클릭하여 업로드
-                    </p>
-                    <p style={{ margin: 0, fontFamily: "Inter, sans-serif", fontSize: 11, color: T.muted }}>
-                      소스코드 폴더를 압축하여 업로드 — Semgrep OSS + CodeQL 정적 분석 실행
-                    </p>
-                    <input ref={fileRef} type="file" accept=".zip,.tar.gz" style={{ display: "none" }}
-                      onChange={e => { const f = e.target.files?.[0]; if (f) setZipFile(f); }} />
-                  </div>
-                )
-              )}
 
-              {scanning && sastEnabled && (
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <motion.div style={{ width: 6, height: 6, borderRadius: "50%", background: T.purple }}
-                    animate={{ opacity: [1, 0.2, 1] }} transition={{ repeat: Infinity, duration: 1, delay: 0.3 }} />
-                  <span style={{ fontFamily: "Inter, sans-serif", fontSize: 11, color: T.purple }}>정적 분석 실행 중...</span>
-                </div>
-              )}
+                {authEnabled && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {/* 인증 방식 서브 탭 */}
+                    <div style={{ display: "flex", gap: 4, background: T.bg, borderRadius: 7, padding: 3, alignSelf: "flex-start" }}>
+                      <button onClick={() => setAuthMode("form")} style={{
+                        padding: "3px 10px", borderRadius: 5, border: "none", cursor: "pointer",
+                        fontFamily: "Inter, sans-serif", fontSize: 10,
+                        fontWeight: authMode === "form" ? 600 : 400,
+                        color: authMode === "form" ? T.blue : T.muted,
+                        background: authMode === "form" ? T.surface : "transparent",
+                        boxShadow: authMode === "form" ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
+                        transition: "all 0.13s",
+                      }}>
+                        계정 양식 로그인 (Form)
+                      </button>
+                      <button onClick={() => setAuthMode("header")} style={{
+                        padding: "3px 10px", borderRadius: 5, border: "none", cursor: "pointer",
+                        fontFamily: "Inter, sans-serif", fontSize: 10,
+                        fontWeight: authMode === "header" ? 600 : 400,
+                        color: authMode === "header" ? T.blue : T.muted,
+                        background: authMode === "header" ? T.surface : "transparent",
+                        boxShadow: authMode === "header" ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
+                        transition: "all 0.13s",
+                      }}>
+                        세션 쿠키/헤더 직접 주입 (Cookie)
+                      </button>
+                    </div>
+
+                    {authMode === "form" ? (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, background: T.bg, padding: 10, borderRadius: 8, border: `1.5px solid ${T.border}` }}>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.sub, fontWeight: 600 }}>로그인 페이지 URL</label>
+                          <input 
+                            value={loginUrl} onChange={e => setLoginUrl(e.target.value)}
+                            placeholder="https://target-service.com/login"
+                            style={{ border: `1px solid ${T.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 11, fontFamily: "JetBrains Mono, monospace" }}
+                          />
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.sub, fontWeight: 600 }}>성공 식별문자 (Logged in Indicator)</label>
+                          <input 
+                            value={loggedInIndicator} onChange={e => setLoggedInIndicator(e.target.value)}
+                            placeholder="Logout"
+                            style={{ border: `1px solid ${T.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 11, fontFamily: "JetBrains Mono, monospace" }}
+                          />
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.sub, fontWeight: 600 }}>ID Input name 속성</label>
+                          <input 
+                            value={usernameField} onChange={e => setUsernameField(e.target.value)}
+                            placeholder="username"
+                            style={{ border: `1px solid ${T.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 11, fontFamily: "JetBrains Mono, monospace" }}
+                          />
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.sub, fontWeight: 600 }}>PW Input name 속성</label>
+                          <input 
+                            value={passwordField} onChange={e => setPasswordField(e.target.value)}
+                            placeholder="password"
+                            style={{ border: `1px solid ${T.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 11, fontFamily: "JetBrains Mono, monospace" }}
+                          />
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.sub, fontWeight: 600 }}>테스트용 ID</label>
+                          <input 
+                            value={username} onChange={e => setUsername(e.target.value)}
+                            placeholder="test_user"
+                            style={{ border: `1px solid ${T.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 11, fontFamily: "JetBrains Mono, monospace" }}
+                          />
+                        </div>
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <label style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.sub, fontWeight: 600 }}>테스트용 PW</label>
+                          <input 
+                            type="password"
+                            value={password} onChange={e => setPassword(e.target.value)}
+                            placeholder="••••••••"
+                            style={{ border: `1px solid ${T.border}`, borderRadius: 4, padding: "4px 8px", fontSize: 11, fontFamily: "JetBrains Mono, monospace" }}
+                          />
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, background: T.bg, padding: 10, borderRadius: 8, border: `1.5px solid ${T.border}` }}>
+                        <label style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.sub, fontWeight: 600 }}>인증 헤더 / 쿠키 문자열 입력</label>
+                        <input 
+                          value={customHeader} onChange={e => setCustomHeader(e.target.value)}
+                          placeholder="Cookie: SESSION_ID=abc123xyz  또는  Authorization: Bearer mytoken..."
+                          style={{ border: `1px solid ${T.border}`, borderRadius: 4, padding: "6px 8px", fontSize: 11, fontFamily: "JetBrains Mono, monospace", width: "100%" }}
+                        />
+                        <span style={{ fontFamily: "Inter, sans-serif", fontSize: 9, color: T.muted }}>
+                          * 로그인 모달이 팝업으로 뜰 때 개발자 도구(F12)에서 발급된 실제 Cookie 헤더값을 그대로 복사해 오면 ZAP에 강제 매핑됩니다.
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
-
-        <Divider />
 
         {/* 액션 바 */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 16px", background: T.bg }}>
           <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
-            {(dastEnabled ? ["OWASP ZAP"] : []).concat(sastEnabled ? ["Semgrep OSS", "CodeQL"] : []).concat(["KISA W-01~W-28", "ISMS-P"]).map(t => (
+            {(dastEnabled ? ["OWASP ZAP"] : []).concat(["KISA W-01~W-28", "ISMS-P"]).map(t => (
               <span key={t} style={{ fontFamily: "Inter, sans-serif", fontSize: 10, color: T.muted, background: T.surface, border: `1px solid ${T.border}`, borderRadius: 4, padding: "1px 7px" }}>{t}</span>
             ))}
           </div>
           <button
-            onClick={() => { if (!scanning && canScan) onScan(); }}
+            onClick={triggerScanApi}
             style={{
               display: "flex", alignItems: "center", gap: 7,
               padding: "8px 20px", borderRadius: 8, border: "none",
@@ -362,6 +444,13 @@ function ScanInputPanel({ scanning, onScan }: { scanning: boolean; onScan: () =>
             {scanning ? "스캔 실행 중..." : "스캔 시작"}
           </button>
         </div>
+
+        {scanError && (
+          <div style={{ display: "flex", alignItems: "center", gap: 7, padding: "8px 16px", background: T.redBg, borderTop: `1px solid ${T.red}22` }}>
+            <AlertTriangle size={12} color={T.red} />
+            <span style={{ fontFamily: "Inter, sans-serif", fontSize: 11, color: T.red }}>{scanError}</span>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -371,8 +460,20 @@ function ScanInputPanel({ scanning, onScan }: { scanning: boolean; onScan: () =>
 // 메인
 // ─────────────────────────────────────────
 
-export function PipelineScreen({ onGoToTriage }: { onGoToTriage: () => void }) {
-  const [scanning, setScanning] = useState(false);
+export function PipelineScreen({ onGoToTriage, scanning, scanError, scanProgress, onScanStart, onScanProgress, onScanFinish }: {
+  onGoToTriage: () => void;
+  scanning: boolean;
+  scanError: string | null;
+  scanProgress: ScanProgress | null;
+  onScanStart: () => void;
+  onScanProgress: (progress: ScanProgress) => void;
+  onScanFinish: (result: ScanResult | null, error?: string) => void;
+}) {
+  const phaseLabel = scanProgress?.phase === "openapi_discovery" ? "API 스펙 탐지"
+    : scanProgress?.phase === "spider" ? "크롤링(Spider)"
+    : scanProgress?.phase === "ajax_spider" ? "크롤링(JS 렌더링)"
+    : scanProgress?.phase === "ascan" ? "액티브 스캔"
+    : "동적";
 
   return (
     <div style={{ flex: 1, overflowY: "auto", background: T.bg, padding: "20px 28px", display: "flex", flexDirection: "column", gap: 20 }}>
@@ -380,9 +481,15 @@ export function PipelineScreen({ onGoToTriage }: { onGoToTriage: () => void }) {
       {/* 스캔 입력 */}
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, paddingTop: 4 }}>
         <p style={{ fontFamily: "Inter, sans-serif", fontSize: 12, color: T.muted, margin: 0 }}>
-          DAST / SAST 개별 또는 동시 스캔 — Argus ASPM
+          OWASP ZAP DAST 동적 스캔 — Argus ASPM
         </p>
-        <ScanInputPanel scanning={scanning} onScan={() => setScanning(true)} />
+        <ScanInputPanel
+          scanning={scanning}
+          scanError={scanError}
+          onScanStart={onScanStart}
+          onScanProgress={onScanProgress}
+          onScanFinish={onScanFinish}
+        />
       </div>
 
       {/* ── 3단계 파이프라인 (동일 너비) ── */}
@@ -402,9 +509,7 @@ export function PipelineScreen({ onGoToTriage }: { onGoToTriage: () => void }) {
               : <Pill label="대기" color={T.muted} bg={T.bg} />}
           />
           <PipeBody>
-            <ScanBar label="OWASP ZAP DAST" tag="동적" tagColor={T.blue} barColor={T.blue} delay={0} running={scanning} />
-            <ScanBar label="Semgrep OSS SAST" tag="정적" tagColor={T.purple} barColor={T.purple} delay={280} running={scanning} />
-            <ScanBar label="CodeQL 심층 분석" tag="정적" tagColor={T.purple} barColor={T.purple} delay={520} running={scanning} />
+            <ScanBar label="OWASP ZAP DAST" tag={phaseLabel} tagColor={T.blue} barColor={T.blue} running={scanning} percent={scanProgress?.percent ?? 0} />
             <Divider />
             {/* 탐지 수치 — 흐릿하게 */}
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", borderRadius: 8, background: T.bg }}>
@@ -415,7 +520,7 @@ export function PipelineScreen({ onGoToTriage }: { onGoToTriage: () => void }) {
               <span style={{ fontFamily: "JetBrains Mono, monospace", fontSize: 22, fontWeight: 700, color: "#CBD5E1" }}>1,690</span>
             </div>
             <p style={{ fontFamily: "Inter, sans-serif", fontSize: 11, color: T.muted, lineHeight: 1.65, margin: 0 }}>
-              HTTP 엔드포인트 동적 공격 + 소스코드 정적 분석. 오탐 및 중복 포함된 원시 데이터입니다.
+              HTTP 엔드포인트 동적 취약점 공격 진단. 오탐 및 중복 포함된 원시 데이터입니다.
             </p>
           </PipeBody>
         </PipeCard>
