@@ -193,6 +193,7 @@ function ScanInputPanel({ scanning, scanError, onScanStart, onScanProgress, onSc
   const [dastEnabled, setDastEnabled] = useState(true);
   const [sastEnabled, setSastEnabled] = useState(false);
   const [dastUrl, setDastUrl]         = useState("");
+  const [apiBaseUrl, setApiBaseUrl]   = useState(""); // Swagger 명세용 API 베이스 URL 상태 추가
   
   // 로그인 및 인증 설정 상태 추가
   const [authEnabled, setAuthEnabled] = useState(false);
@@ -247,7 +248,8 @@ function ScanInputPanel({ scanning, scanError, onScanStart, onScanProgress, onSc
           password: password,
           logged_in_indicator: loggedInIndicator
         } : null,
-        custom_header: authEnabled && authMode === "header" ? customHeader : null
+        custom_header: authEnabled && authMode === "header" ? customHeader : null,
+        api_base_url: apiBaseUrl.trim() ? apiBaseUrl.trim() : null // Swagger API URL 페이로드 주입
       };
 
       const response = await fetch(`${SCAN_API_BASE}/`, {
@@ -304,6 +306,16 @@ function ScanInputPanel({ scanning, scanError, onScanStart, onScanProgress, onSc
                   value={dastUrl} onChange={e => setDastUrl(e.target.value)}
                   placeholder="https://target-service.com"
                   style={{ flex: 1, border: "none", outline: "none", fontFamily: "JetBrains Mono, monospace", fontSize: 13, color: T.text, background: "transparent" }}
+                />
+              </div>
+
+              {/* API Base URL / Swagger 스펙 연동 필드 */}
+              <div style={{ display: "flex", alignItems: "center", gap: 8, borderTop: `1px solid ${T.border}`, paddingTop: 8, marginTop: 4 }}>
+                <Code2 size={13} color={T.muted} style={{ flexShrink: 0 }} />
+                <input
+                  value={apiBaseUrl} onChange={e => setApiBaseUrl(e.target.value)}
+                  placeholder="백엔드 API 서버 URL (예: http://localhost:8080 - Swagger/OpenAPI 연동)"
+                  style={{ flex: 1, border: "none", outline: "none", fontFamily: "JetBrains Mono, monospace", fontSize: 11, color: T.sub, background: "transparent" }}
                 />
               </div>
 
