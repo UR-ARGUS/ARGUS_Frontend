@@ -481,10 +481,10 @@ export function PipelineScreen({ onGoToTriage, scanning, scanError, scanProgress
   onScanProgress: (progress: ScanProgress) => void;
   onScanFinish: (result: ScanResult | null, error?: string) => void;
 }) {
-  const phaseLabel = scanProgress?.phase === "openapi_discovery" ? "API 스펙 탐지"
-    : scanProgress?.phase === "spider" ? "크롤링(Spider)"
-    : scanProgress?.phase === "ajax_spider" ? "크롤링(JS 렌더링)"
-    : scanProgress?.phase === "ascan" ? "액티브 스캔"
+  const phaseLabel = scanProgress?.phase === "collect" ? "크롤링(ZAP Ajax Spider)"
+    : scanProgress?.phase === "classify" ? "파라미터 분류"
+    : scanProgress?.phase === "manipulate" ? "페이로드 주입/이상 탐지"
+    : scanProgress?.phase === "llm_review" ? "LLM 취약점 판정"
     : "동적";
 
   return (

@@ -23,6 +23,6 @@ export interface ScanResult {
 }
 
 export interface ScanProgress {
-  phase: "openapi_discovery" | "spider" | "ajax_spider" | "ascan";
+  phase: "collect" | "classify" | "manipulate" | "llm_review";
   percent: number;
 }
